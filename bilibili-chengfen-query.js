@@ -5,7 +5,7 @@
 // @author       Huizs
 // @license      GPLv3
 // @icon         https://static.hdslb.com/images/favicon.ico
-// @description  评论区楼层自动挂成分标签；直播间弹幕栏用户名旁挂同一个查询按钮（可关闭）；点击楼层图标打开单人面板：首屏并发 card 与动态首页，勋章墙 / 关注列表 / 动态翻页在后台补全。标签页：成分（49 条内置规则推断 + 关注/勋章实锤 + 命中原文直链，标签只展示不跳转）、规则（增删改 / 导入导出 / 恢复默认，内置更新按 id 合并）。
+// @description  评论区楼层自动挂成分标签；直播间弹幕栏用户名旁挂同一个查询按钮；点击楼层图标打开单人面板：首屏并发 card 与动态首页，勋章墙 / 关注列表 / 动态翻页在后台补全。规则（增删改 / 导入导出 / 恢复默认，内置更新按 id 合并）。
 // @connect      api.bilibili.com
 // @connect      api.live.bilibili.com
 // @connect      api.aicu.cc
