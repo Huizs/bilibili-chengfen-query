@@ -18,8 +18,6 @@
 // @run-at       document-end
 // ==/UserScript==
 
-/* @namespace 故意不改：部分管理器按「命名空间+名称」归档 GM 存储，改了会让用户的规则表、面板位置与缓存变成空数据。 */
-
 /* ── 内联 js-md5 v0.8.3（MIT，© Chen, Yi-Cyuan，https://github.com/emn178/js-md5）──
  * 不用 @require 拉 CDN：CDN 取不到时 md5 为 undefined，WBI 验签路径整体失效，表现为所有用户命中默认标签。
  * 库把实现挂在 window.md5（油猴沙箱内即脚本作用域）。下面它自己的文件头注释保留原样。
