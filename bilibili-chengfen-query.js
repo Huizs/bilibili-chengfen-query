@@ -422,8 +422,6 @@
         { id: 'g2_endfield',  g: '二游', n: '终末地',         k: '终末地|Endfield', c: '#6600CC' },
         { id: 'g2_yihuan',    g: '二游', n: '异环',           k: '异环|NTE|Neverness To Everness', c: 'pink' },
         { id: 'g2_wuxianda',  g: '二游', n: '无限大',         k: '代号无限大|无限大|Ananta|Project Ananta', c: 'pink' },
-        // 裸「崩坏」不指向特定代际，单独成一条系列标签：保留命中信息，不做代际推断
-        { id: 'g2_bhfamily',  g: '二游', n: '崩坏系列',       k: '崩坏', c: '#0066FF' },
 
         // ── 网游 ──
         { id: 'g3_xianjian',  g: '网游', n: '仙剑',     k: '仙剑', c: '#6666FF' },
