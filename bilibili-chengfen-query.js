@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站成分查询
 // @namespace    bilibili.chengfen.online
-// @version      1.0
+// @version      1.1
 // @author       Huizs
 // @license      GPL-3.0
 // @icon         https://static.hdslb.com/images/favicon.ico
@@ -57,10 +57,11 @@
         floorMaxEntries: 300,
         personTtl: 10 * 60 * 1000,     // 面板按人缓存：10 分钟（纯内存，刷新即清）
 
-        // ── 三个上限均为天花板而非配额：正常路径不会触及 ──
+        // ── 四个上限均为天花板而非配额：正常路径不会触及 ──
         dynPages: 3,                   // 面板里一个人最多翻 3 页动态（楼层仍然只 1 页）
         floorInflight: 20,             // 楼层自动标签同时在飞的上限；首屏 20 人正好一轮全发
         floorMargin: 800,              // 楼层视口裁剪：上下各 800px 内才查，屏幕外不发
+        floorContainersMax: 600,       // 已挂标签楼层的记账上限，超出时剔除已销毁的那些
     };
 
     /* ══════════════ 工具 ══════════════ */
@@ -761,6 +762,9 @@
 
     /* 第二、三条证据通道只在打开单人面板时请求，楼层一条不发。
      * 命中升级为实锤，未命中不下否定结论：关注列表受隐私与截断影响，勋章墙可隐藏，缺席不足以证伪。 */
+    // 证据格读不到时的占位：必须带 hits 数组，渲染层直接对它做 map
+    const evFail = err => ({ hits: [], medalNote: '证据读取失败：' + String((err && err.message) || err), followNote: '' });
+
     async function fetchEvidence(mid) {
         const out = { hits: [], medals: null, follows: null, medalNote: '', followNote: '' };
         const jobs = [];
@@ -937,6 +941,11 @@
                 state.query.ev = r;
                 personCache.patch(mid, { ev: r });
                 render();
+            }).catch(err => {
+                if (me !== querySeq) return;
+                // 不 catch 的话这一格永远停在「读取中…」，与失败要响的原则相反
+                state.query.ev = evFail(err);
+                render();
             });
         }
 
@@ -952,6 +961,12 @@
                 personCache.patch(mid, { extra: e.profile });
             }
             applyCorpus();
+        }).catch(err => {
+            if (me !== querySeq) return;
+            // 同上：补全失败要让「补全中…」停下来并说出原因
+            state.query.extraLoading = false;
+            state.query.extraFail = String((err && err.message) || err);
+            render();
         });
     }
 
@@ -1696,6 +1711,8 @@
                 state.query.ev = null;
                 fetchEvidence(m).then(r => {
                     if (state.query?.mid === m) { state.query.ev = r; render(); }
+                }).catch(err => {
+                    if (state.query?.mid === m) { state.query.ev = evFail(err); render(); }
                 });
             }
             return render();
@@ -1760,7 +1777,7 @@
         }));
     }
 
-    const floorMem = new Map(), floorPending = new Set(), floorContainers = [];
+    const floorMem = new Map(), floorPending = new Set(), floorContainers = new Set();
     const floorWaiters = new Map();   // uid -> 等待同一份结果的其他楼层
 
     /* ── 楼层流程的两个上限，都是天花板不是配额 ──
@@ -1803,7 +1820,12 @@
         container.querySelectorAll('.cfq3-tag').forEach(el => el.remove());
         const anchor = container.querySelector('.cfq3-floor');   // 标签排在查询图标左侧
         for (const t of tags) container.insertBefore(tagSpan(t, uid), anchor || null);
-        if (!floorContainers.includes(container)) floorContainers.push(container);
+        if (!floorContainers.has(container)) {
+            floorContainers.add(container);
+            // 集合只增不减会持住已销毁楼层的整棵 shadow 树：超出上限时剔除断开的那些
+            if (floorContainers.size > CFG.floorContainersMax)
+                for (const c of floorContainers) if (!c.isConnected) floorContainers.delete(c);
+        }
     }
 
     const floorTagsOf = raws => analyze(collectCorpus(raws)).tags;
@@ -1855,9 +1877,8 @@
     }
 
     function clearFloorTags() {
-        for (let i = floorContainers.length - 1; i >= 0; i--) {
-            const c = floorContainers[i];
-            if (!c.isConnected) { floorContainers.splice(i, 1); continue; }
+        for (const c of floorContainers) {
+            if (!c.isConnected) { floorContainers.delete(c); continue; }
             c.querySelectorAll('.cfq3-tag').forEach(el => el.remove());
         }
     }
