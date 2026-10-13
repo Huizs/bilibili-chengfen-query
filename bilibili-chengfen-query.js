@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站成分查询
 // @namespace    bilibili.chengfen.online
-// @version      1.1
+// @version      1.2.1
 // @author       Huizs
 // @license      GPL-3.0
 // @icon         https://static.hdslb.com/images/favicon.ico
@@ -62,6 +62,13 @@
         floorInflight: 20,             // 楼层自动标签同时在飞的上限；首屏 20 人正好一轮全发
         floorMargin: 800,              // 楼层视口裁剪：上下各 800px 内才查，屏幕外不发
         floorContainersMax: 600,       // 已挂标签楼层的记账上限，超出时剔除已销毁的那些
+
+        // ── 播放器弹幕列表反查 ──
+        dmSegMs: 360000,               // B站 弹幕分段实测 6 分钟（view 的 segment_size=360000）
+        dmSegCacheMax: 12,             // 已解析分段的只数上限：段内含弹幕正文，只在内存
+        dmSegEntriesMax: 6000,         // 单段保留的弹幕条数上限（B站 服务端本身就有截断）
+        dmUidTtl: 30 * 24 * 3600e3,    // midHash→UID 是稳定映射，给 30 天只为兜住算法变更
+        dmUidMax: 800,
     };
 
     /* ══════════════ 工具 ══════════════ */
@@ -103,21 +110,24 @@
     function xhr(opts) {
         return new Promise(resolve => GM_xmlhttpRequest({
             ...opts,
-            onload: res => resolve({ status: res.status, text: res.responseText }),
+            onload: res => resolve({ status: res.status, text: opts.responseType ? '' : res.responseText, buf: res.response }),
             // net 表示连接层失败（DNS、断网、连接被重置）。与风控的区别在于：只要返回了任意 HTTP 状态码即视为网络可达，468 亦然。
             onerror: () => resolve({ net: true, fail: '连不上（DNS/断网/连接被重置）' }),
             ontimeout: () => resolve({ net: true, fail: '连接超时' }),
         }));
     }
 
-    async function send(method, url, { timeout, referer, body } = {}) {
+    async function send(method, url, { timeout, referer, body, binary } = {}) {
         const headers = {};
         if (referer) { headers.referer = referer; headers['x-referer'] = referer; }
         if (body) headers['content-type'] = 'application/json';
         // 无额外请求头时不传 headers 字段，与 aicu 的可用调用形态保持一致
-        const r = await xhr({ method, url, timeout: timeout || 10000, headers: Object.keys(headers).length ? headers : undefined, data: body, anonymous: false });
+        const r = await xhr({ method, url, timeout: timeout || 10000, headers: Object.keys(headers).length ? headers : undefined, data: body,
+            responseType: binary ? 'arraybuffer' : undefined, anonymous: false });
         if (r.fail) return r;
         if (r.status === 412 || r.status === 429 || r.status === 468) return { risk: true, fail: `HTTP ${r.status}`, text: r.text };
+        // 弹幕分段越界时 B站 回 304 空体，这是"这一段没弹幕"而不是失败
+        if (binary) return (r.status === 200 || r.status === 304) ? { bin: r.buf || new ArrayBuffer(0) } : { fail: `HTTP ${r.status}` };
         if (r.status !== 200) return { fail: `HTTP ${r.status}`, text: r.text };
         let json;
         try { json = JSON.parse(r.text); }
@@ -239,6 +249,9 @@
     const dmCache = mkCache({ ttl: CFG.cacheTtl, max: 80 });
     const tagCache = mkCache({ gmKey: 'cfq_floor_cache_v2', ttl: CFG.floorTtl, max: CFG.floorMaxEntries });
     const personCache = mkCache({ ttl: CFG.personTtl, max: 80 });
+    // 播放器弹幕列表：分段里含弹幕正文，只进内存；midHash→UID 不含正文，才落 GM
+    const dmSegCache = mkCache({ ttl: CFG.cacheTtl, max: CFG.dmSegCacheMax });
+    const dmUidCache = mkCache({ gmKey: 'cfq_dm_uid', ttl: CFG.dmUidTtl, max: CFG.dmUidMax });
     const domProfile = mkCache({ max: 300 });
 
     const qsBuild = params => Object.entries(params)
@@ -702,6 +715,9 @@
         dm: { ...blankTab(), src: 'vd' },   // 弹幕页：vd=视频弹幕 ld=直播弹幕
         auto: GM_getValue('cfq_auto', true) !== false,   // 楼层自动挂标签，默认开
         liveTags: GM_getValue('cfq_live', true) !== false, // 直播间弹幕行旁的查询按钮，默认开
+        dmList: GM_getValue('cfq_dm_list', true) !== false, // 弹幕列表中的查询按钮，默认开
+        dmVerify: GM_getValue('cfq_dm_verify', true) !== false, // 多候选时逐个查名片，只留真存在的号，默认开
+        dmDeep: GM_getValue('cfq_dm_deep', false) === true, // 反解扩到 10 位：覆盖更多号但候选更杂，默认关
         relay: GM_getValue('cfq_relay', false) === true, // 加速源（中转），默认关
         queryOn: GM_getValue('cfq_query', true) !== false,  // 关闭后只留「成分」与「规则」
         showSettings: false,
@@ -888,13 +904,15 @@
 
     let querySeq = 0;      // 后台补数据回来时用它判断「人还在不在这一页」
 
-    async function runQuery(raw) {
+    // note 只用于面板头部标注「这次是谁触发的」，弹幕候选切换靠它让两次点击长出区别
+    async function runQuery(raw, note) {
         const me = ++querySeq;
         const want = String(raw || '').trim();
         state.tab = 'query';
         // 换查询对象即换上下文：清掉上一个人的规则筛选，避免它残留在新数据上
         state.filter = '';
-        state.query = { mid: want, loading: true };
+        markActive(null);                             // 描边只跟「最后一次查询」，从弹幕/输入框查的也要把它摘掉
+        state.query = { mid: want, loading: true, note: note || '' };
         render();                                     // 点下去立刻出面板骨架，不在空白里转圈
         const got = await resolveUid(want);
         if (got.fail) { state.query = { mid: want, error: got.fail }; return render(); }
@@ -906,7 +924,7 @@
         bucketUse(mid, state.dm.src, 'dm');
         const cache = personCache.get(mid);
         state.query = { mid, resolved: got.via || null, card: cache?.card || null,
-            dynRaws: cache?.raws || null, extra: cache?.extra || null, loading: true };
+            dynRaws: cache?.raws || null, extra: cache?.extra || null, loading: true, note: note || '' };
         render();
 
         // card 与动态互不依赖：动态先行（不占限流队列），card 在队列中排队，先返回者先渲染
@@ -1173,11 +1191,18 @@
 
     function settingsPop() {
         return `<div class="set">
+          <div class="sg">总开关</div>
           ${swPill('查询功能', state.queryOn, 'set-query', '关闭后只保留「成分」与「规则」两个标签页，其余隐藏')}
           ${swPill('数据源加速', state.relay, 'relay-toggle', '尝试中转，随时失效')}
           <div class="sn">默认关，切换数据源</div>
+          <div class="sg">查询入口挂载</div>
           ${swPill('评论区标签', state.auto, 'auto-toggle', '在评论区楼层旁自动挂成分标签')}
           ${swPill('直播页查询按钮', state.liveTags, 'live-toggle', '在直播间弹幕栏的昵称旁挂查询按钮，只挂按钮不发请求')}
+          ${swPill('弹幕列表查询', state.dmList, 'dm-list-toggle', '视频页播放器弹幕列表：悬停出现查询按钮，点了才拉那一段弹幕')}
+          <div class="sg">弹幕发送者反查</div>
+          ${swPill('不猜号', state.dmVerify, 'dm-verify-toggle', '一条弹幕常常同时对应好几个 UID。开着时会挨个查一遍名片，只留真有其人的；一个都对不上就直说查不到，不会硬塞给你一个疑似号。只在出现多个候选时才多发几个请求')}
+          ${swPill('多认 10 位新号', state.dmDeep, 'dm-deep-toggle', '关：只认 9 位以内的老号，实测一条弹幕 64% 能认出来。开：连 10 位号一起认，能认出的升到 98%，代价是一条弹幕会同时冒出更多疑似号，要靠上面的「不猜号」收。16 位新号两种都认不出')}
+          <div class="sg">单人证据通道</div>
           ${swPill('勋章墙', state.evMedal, 'ev-evMedal', '读取目标持有的粉丝勋章，牌名精确匹配才算实锤')}
           ${swPill('关注列表', state.evFollow, 'ev-evFollow', '读取目标的关注列表做名字匹配，可能被隐私隐藏且需翻页')}
           ${swPill('动态翻页', state.evDynPages, 'ev-evDynPages', '查单人时读取最近 3 页动态，否则只读 1 页')}
@@ -1197,12 +1222,13 @@
             const lean = profileFromCard(null, q.mid);
             return input + `<div class="hd">${lean.face ? `<img src="${esc(lean.face)}">` : '<div class="sk" style="width:38px;height:38px;border-radius:50%"></div>'}
               <div><div class="nm">${esc(lean.name) || '<span class="t">读取中…</span>'}</div>
-              <div class="t">UID ${esc(q.mid)}${lean.level != null ? ' · LV' + lean.level : ''}</div></div></div>
+              <div class="t">UID ${esc(q.mid)}${lean.level != null ? ' · LV' + lean.level : ''}${q.note ? ' · ' + esc(q.note) : ''}</div></div></div>
               <div class="sk" style="width:70%"></div><div class="sk" style="width:90%"></div><div class="sk" style="width:55%"></div>`;
         }
         const p = q.profile || {}, c = q.card?.card || {};
         return input + `
-        <div class="hd"><img src="${esc(p.face || '')}"><div><div class="nm">${esc(p.name) || '（无资料）'}</div><div class="t">UID ${esc(q.mid)}${q.resolved ? ' · ' + esc(q.resolved) : ''}</div></div></div>
+        <div class="hd"><img src="${esc(p.face || '')}"><div><div class="nm">${esc(p.name) || '（无资料）'}</div><div class="t">UID ${esc(q.mid)}${q.resolved ? ' · ' + esc(q.resolved) : ''}${q.note ? ' · ' + esc(q.note) : ''}</div></div></div>
+        ${q.warn ? '<div class="warn">' + esc(q.warn) + '</div>' : ''}
         <h4>推断 · 关键词命中</h4>
         <div class="un">语料：动态 ${q.corpusCount || 0} 条 / ${num(q.corpusFields)} 个文本字段${q.dynRaws?.length > 1 ? ` · 翻了 ${q.dynRaws.length} 页` : ''}（★=TA 自己写的，·=卡片挂载字段）${q.corpusThin ? ' · <b>动态 0 条，下面只依据昵称签名</b>' : ''}${q.dynPartial ? ' · <b>' + esc(q.dynPartial) + '</b>' : ''}${q.dynFail ? ' · <b>动态报错：' + esc(q.dynFail) + '</b>' : ''}</div>
         ${q.guess?.length ? q.guess.map(t => `${chip(t)}<div class="why">${esc(t.why)}</div>`).join('') : '<span class="un">未命中关键词</span>'}
@@ -1389,11 +1415,14 @@
       .sw + .sw{margin-left:0}      /* 两颗药丸挨着排，别让第二颗的 auto 外边距把它们撑开 */
       .row .sw{margin-left:0}       /* 证据通道那排药丸排在 .row 里，不要贴到右边 */
       /* 设置弹层：开关不常驻标签栏，由齿轮展开 */
-      .set{position:absolute;right:8px;top:100%;margin-top:2px;z-index:2;background:#fff;border:1px solid #ececec;
-        border-radius:9px;box-shadow:0 6px 22px rgba(0,0,0,.14);padding:7px 10px;min-width:200px;cursor:default}
+      .set{position:fixed;left:0;top:0;z-index:2;background:#fff;border:1px solid #ececec;
+        border-radius:9px;box-shadow:0 6px 22px rgba(0,0,0,.14);padding:7px 10px;min-width:200px;cursor:default;
+        max-height:calc(100vh - 16px);overflow:auto}
       .set .si{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:3px 0;font-size:12px;color:#555}
       .set .si .sw{margin-left:0}
       .set .sn{color:#bbb;font-size:11px;margin:-2px 0 3px;text-align:right}
+      .set .sg{margin:8px 0 2px;padding-top:6px;border-top:1px solid #f0f0f0;color:#999;font-size:11px;letter-spacing:.5px}
+      .set .sg:first-child{margin-top:0;padding-top:0;border-top:0}
       /* 规则页 */
       textarea{width:100%;box-sizing:border-box;border:1px solid #ddd;border-radius:5px;padding:5px 7px;
         font:11px/1.5 Consolas,monospace;color:#333;margin-bottom:8px;resize:vertical}
@@ -1424,6 +1453,17 @@
         panelHost.style.top = clamp(num(panelHost.style.top), 8, Math.max(8, innerHeight - h - 8)) + 'px';
     }
 
+    // 设置弹层是 position:fixed 的：面板本身 overflow:hidden，绝对定位会被底边裁掉。
+    // 锚在齿轮正下方，下面放不下就翻到上方，左右都夹在视口里；拖动面板时要跟着重算。
+    function placeSettings() {
+        if (!shadow || !state.showSettings) return;
+        const set = shadow.querySelector('.set'), gear = shadow.querySelector('[data-act="gear"]');
+        if (!set || !gear) return;
+        const g = gear.getBoundingClientRect(), w = set.offsetWidth, h = set.offsetHeight;
+        set.style.top = (innerHeight - g.bottom - 12 >= h ? g.bottom + 6 : Math.max(8, g.top - 6 - h)) + 'px';
+        set.style.left = clamp(g.right - w, 8, Math.max(8, innerWidth - w - 8)) + 'px';
+    }
+
     function placePanel() {
         const saved = GM_getValue(POS_KEY, null);
         const w = panelHost.offsetWidth || 470, h = panelHost.offsetHeight || 400;
@@ -1441,6 +1481,7 @@
             panelHost.style.left = (ev.clientX - dx) + 'px';
             panelHost.style.top = (ev.clientY - dy) + 'px';
             clampIntoView();
+            placeSettings();      // 弹层是 fixed 的，拖面板时得跟着走
         };
         const up = () => {
             window.removeEventListener('pointermove', move);
@@ -1497,6 +1538,7 @@
         // 仅首次渲染时定位/居中，避免数据分步到达导致面板位移
         if (!placed) { placePanel(); placed = true; }
         else clampIntoView();      // 内容变高时把面板拉回屏内，不让它长到屏幕外
+        placeSettings();           // 面板刚量完尺寸，弹层的 fixed 坐标要按新位置重算
     }
 
     function closePanel() {
@@ -1586,6 +1628,22 @@
             state.liveTags = !state.liveTags;
             GM_setValue('cfq_live', state.liveTags);
             if (state.liveTags) scanLive(); else clearLiveButtons();
+            return render();
+        }
+        if (act === 'dm-list-toggle') {
+            state.dmList = !state.dmList;
+            GM_setValue('cfq_dm_list', state.dmList);
+            if (state.dmList) hookDmList(); else unhookDmList();
+            return render();
+        }
+        if (act === 'dm-verify-toggle') {
+            state.dmVerify = !state.dmVerify;
+            GM_setValue('cfq_dm_verify', state.dmVerify);
+            return render();
+        }
+        if (act === 'dm-deep-toggle') {
+            state.dmDeep = !state.dmDeep;
+            GM_setValue('cfq_dm_deep', state.dmDeep);
             return render();
         }
         if (act === 'query') return runQuery(shadow.querySelector('#mid')?.value.trim());
@@ -1735,9 +1793,24 @@
     const ICON = '<svg viewBox="0 0 1024 1024" width="12" height="12" aria-hidden="true" style="vertical-align:-2px"><path fill="currentColor" d="M448 128a320 320 0 0 1 250.6 519.7l178.2 178.2a42.7 42.7 0 0 1-60.4 60.4L638.2 708.1A320 320 0 1 1 448 128zm0 85.3a234.7 234.7 0 1 0 0 469.4 234.7 234.7 0 0 0 0-469.4z"/></svg>';
 
     // 不右浮动到行尾：#header 右端为 B站的 ornament（铭牌/头像框）卡片，浮动会重叠
+    // margin-right 是给选中态那圈描边留的位：描边贴在按钮外沿，昵称容器 overflow:hidden
+    // 不留位就会被切掉一角。留成常态而不是点中时才加，免得点一下把后面的文字顶得跳
     const FLOOR_STYLE = 'display:inline-flex;align-items:center;vertical-align:middle;' +
-        'margin-left:8px;padding:2px 6px;border-radius:4px;cursor:pointer;color:#fb7299;' +
+        'margin:0 2px 0 8px;padding:2px 6px;border-radius:4px;cursor:pointer;color:#fb7299;' +
         'background:rgba(251,114,153,.08);border:1px solid rgba(251,114,153,.3);user-select:none;';
+
+    // 点一下动一下：让「这一下收到了」看得见。楼层/直播/弹幕三处共用，走 WAAPI 不往页面塞样式表
+    const cfqPulse = (el, base = '') => el.animate(
+        [{ transform: base + 'scale(1)' }, { transform: base + 'scale(1.6)' }, { transform: base + 'scale(1)' }],
+        { duration: 260 });
+    // 当前查询对象描个边，免得在一屏楼层里找刚点的是哪个。只记一个节点引用：
+    // 评论区楼层在影子根里，document 查不到，描边/摘边都只能攥着节点本身。
+    let cfqActiveBtn = null;
+    function markActive(el) {
+        if (cfqActiveBtn && cfqActiveBtn !== el) cfqActiveBtn.style.outline = 'none';
+        cfqActiveBtn = el || null;
+        if (cfqActiveBtn) cfqActiveBtn.style.outline = '1px solid #fb7299';
+    }
 
     function floorButton(uid, extraStyle) {
         const b = document.createElement('span');
@@ -1745,15 +1818,19 @@
         b.innerHTML = ICON;
         b.style.cssText = FLOOR_STYLE + (extraStyle || '');
         b.title = '查成分';
+        b.dataset.cfqUid = uid;                       // 记着这颗按钮绑的是谁，行被复用时要拿它比对
         b.addEventListener('click', e => {
             e.preventDefault(); e.stopPropagation();
-            runQuery(uid);
+            runQuery(uid);        // runQuery 会先清掉上一个描边，所以标记要放在它后面
+            markActive(b);
         });
         return b;
     }
 
     function mountFloorButton(container, uid) {
-        if (!container || !uid || container.querySelector('.cfq3-floor')) return;
+        if (!container || !uid) return;
+        const old = container.querySelector('.cfq3-floor');
+        if (old) { if (old.dataset.cfqUid === String(uid)) return; old.remove(); }   // 容器被换成别人：重挂，别查错人
         container.appendChild(floorButton(uid));
     }
 
@@ -1929,7 +2006,7 @@
      * #chat-items > div.chat-item.danmaku-item，无 shadow DOM；UID 在行 data-uid，昵称在 .common-nickname-wrapper。
      * 行只追加不回收（实测 9s 内 109→157 且 uid 不复用），故按行 dataset 记账即可。
      */
-    const LIVE_STYLE = 'margin-left:4px;padding:0 5px;';
+    const LIVE_STYLE = 'margin-left:4px;margin-right:2px;padding:0 5px;';
     const LIVE_CAP = 40;      // 单轮最多挂载的行数：进入房间时列表已有数百条，分摊到数轮完成
     let liveRoot = null, liveObserver = null;
 
@@ -1951,17 +2028,24 @@
         for (let i = list.children.length - 1; i >= 0 && todo.length < LIVE_CAP; i--) {
             const row = list.children[i];
             if (row?.nodeType !== 1 || !row.classList.contains('danmaku-item')) continue;
-            if (row.dataset.cfqLive) continue;
-            row.dataset.cfqLive = '1';             // 先行登记：本轮无法挂载的匿名行无需下一轮再遍历
+            // 登记里存的是「这行当时是谁」而不是一个 1：直播弹幕行会被回收复用，
+            // 只认「挂过就不再管」会让按钮停在旧 UID 上，点出来的是别人的成分
+            const cur = row.dataset.uid || '0';
+            if (row.dataset.cfqLive === cur) continue;
+            row.dataset.cfqLive = cur;             // 先行登记：本轮无法挂载的匿名行无需下一轮再遍历
             todo.push(row);
         }
         for (const row of todo) {
-            const uid = row.dataset.uid;
-            if (!uid || uid === '0' || !/^\d+$/.test(uid)) continue;   // 匿名发言 / 系统消息
+            const uid = row.dataset.uid || '0';
+            if (uid === '0' || !/^\d+$/.test(uid)) { row.dataset.cfqLive = uid; continue; }   // 匿名发言/系统消息：本来就不挂，登记掉免得反复遍历
             const wrap = row.querySelector('.common-nickname-wrapper') || row.querySelector('.user-name')?.parentElement;
-            if (!wrap || wrap.querySelector('.cfq3-floor')) continue;
-            wrap.dataset.cfqUid = uid;
-            wrap.appendChild(floorButton(uid, LIVE_STYLE));
+            if (!wrap) continue;                                  // 昵称节点还没渲染出来：不登记，下一轮再试
+            if (wrap.dataset.cfqUid !== uid) {                    // 换人了：先摘掉上一位的按钮再挂新的
+                wrap.querySelector('.cfq3-floor')?.remove();
+                wrap.dataset.cfqUid = uid;
+                wrap.appendChild(floorButton(uid, LIVE_STYLE));
+            }
+            row.dataset.cfqLive = uid;
         }
     }
 
@@ -1972,14 +2056,226 @@
         for (const row of list.children) {
             if (row?.nodeType !== 1) continue;
             row.querySelectorAll('.cfq3-floor').forEach(b => b.remove());
+            // 昵称框上的「挂给谁」也要一起清掉，否则重新打开时会被判定成「还是那个人」而不再挂
+            row.querySelectorAll('[data-cfq-uid]').forEach(w => delete w.dataset.cfqUid);
             if (row.dataset) delete row.dataset.cfqLive;
         }
+    }
+
+    /* ══════════════ 播放器弹幕列表：就地反查发送者 ══════════════
+     * B站 只在 seg.so 的 protobuf 里给 midHash（字段 6），没有 UID 字段；midHash 就是 UID 十进制串的
+     * CRC32（无盐），所以本地建 10 万条彩虹表即可爆破回来，不必引第三方数据源。
+     * 面板行本身既无 midHash 也拿不到播放器闭包，因此必须自己拉该段再按「整秒 + 文本」对齐：
+     * 面板显示的秒数是向下取整，用 round 会漏掉一半；分段实测 6 分钟一段，越界段回 304 空体。
+     * 段内含弹幕正文，只进内存；持久化的只有 midHash→UID 这一层无正文的映射。
+     */
+    const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const CRC_T = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) { let c = i; for (let j = 0; j < 8; j++) c = (c & 1) ? (c >>> 1) ^ 0xEDB88320 : c >>> 1; CRC_T[i] = c; }
+    const crcUp = (crc, b) => ((crc >>> 8) ^ CRC_T[(crc ^ b) & 255]) >>> 0;
+    const crcDigits = n => { let c = 0; for (const d of String(n)) c = crcUp(c, Number(d)); return c >>> 0; };
+    const crcPad5 = c => { for (let i = 0; i < 5; i++) c = crcUp(c, 0); return c >>> 0; };   // 前缀变体：位数差 5 以内靠补零对齐
+
+    /* 彩虹表约 1.1 MB TypedArray，只在第一次真要爆破时建，启动路径不碰。
+     * pad 是「前缀表」：N 位数 = 前缀 × 10 万 + 后缀，所以试到 9 位只需 1 万格前缀，
+     * 试到 10 位就要 10 万格（多约 400 KB，建表实测 12ms）。 */
+    let DM_RAIN = null;
+    const dmRainbow = (padN = 1e4) => {
+        if (DM_RAIN && DM_RAIN.pad.length >= padN) return DM_RAIN;
+        // h>>>16 最大是 65535，所以 65537 格里最后一格是末桶的右边界哨兵
+        const N = 1e5, pad = new Uint32Array(padN), start = new Uint32Array(65537), slot = new Uint32Array(N * 2);
+        for (let i = 0; i < N; i++) start[crcDigits(i) >>> 16]++;
+        for (let i = 1; i < 65537; i++) start[i] += start[i - 1];
+        // 原地递减填充：结束后 start[s] 正好变成桶 s 的起点，start[s + 1] 是终点
+        for (let i = 0; i < N; i++) { const h = crcDigits(i), at = --start[h >>> 16]; slot[at * 2] = h; slot[at * 2 + 1] = i; }
+        for (let i = 0; i < padN; i++) pad[i] = crcPad5(crcDigits(i));
+        return (DM_RAIN = { pad, slot, start });
+    };
+    const dmBucket = h => {
+        const R = dmRainbow(), s = (h >>> 0) >>> 16, out = [];
+        for (let i = R.start[s], e = R.start[s + 1] | 0; i < e; i++) if (R.slot[i * 2] === (h >>> 0)) out.push(R.slot[i * 2 + 1]);
+        return out;
+    };
+    // 逐个位数试：len 位串等价于 0xFFFFFFFF 先吃 len 个 '0' 再吃各位数字值
+    const dmCrack = (hex, maxLen = 9) => {
+        const R = dmRainbow(maxLen > 9 ? 1e5 : 1e4), target = (~Number('0x' + hex)) >>> 0, out = [];
+        let prefix = 4294967295;
+        for (let len = 1; len <= maxLen; len++) {
+            prefix = crcUp(prefix, 48);
+            if (len < 6) out.push(...dmBucket((target ^ prefix) >>> 0));
+            else { const lo = 10 ** (len - 6), hi = Math.min(10 ** (len - 5), R.pad.length); for (let p = lo; p < hi; p++) for (const tail of dmBucket((target ^ prefix ^ R.pad[p]) >>> 0)) out.push(p * 1e5 + tail); }
+        }
+        return out;
+    };
+
+    const UTF8 = new TextDecoder();
+    // 只认 DmSegMobileReply.elems(顶层 1)，元素内取 2=progress(毫秒) 6=midHash 7=content，其余整段跳过
+    function decodeSeg(buf) {
+        const u = new Uint8Array(buf), out = [];
+        let p = 0;
+        const vi = () => { let s = 0, r = 0, b; do { b = u[p++]; r += (b & 127) * 2 ** (7 * s); s++; } while (b & 128 && s < 10); return r; };
+        while (p < u.length && out.length < CFG.dmSegEntriesMax) {
+            if ((vi() >>> 3) !== 1) break;
+            const len = vi(), stop = p + len;             // 先取长度再算边界：写成 p + vi() 会先读旧 p，整段偏一字节
+            const e = { sec: -1, hash: '', text: '' };
+            while (p < stop) {
+                const k = vi(), fn = k >>> 3, wt = k & 7;
+                if (wt === 0) { if (fn === 2) e.sec = Math.floor(vi() / 1000); else vi(); }
+                else if (wt === 2) { const l = vi(); const raw = u.subarray(p, p + l); p += l; if (fn === 6) e.hash = UTF8.decode(raw); else if (fn === 7) e.text = UTF8.decode(raw); }
+                else if (wt === 5) p += 4; else if (wt === 1) p += 8; else { p = stop; break; }
+            }
+            p = stop;
+            if (e.hash && e.sec >= 0) out.push(e);      // 高级/字幕弹幕常缺 progress，无法与面板行对齐
+        }
+        return out;
+    }
+
+    const videoCid = () => Number((W.player?.getManifest?.() || {}).cid || (W.__INITIAL_STATE__ || {}).cid || 0);
+
+    /* 候选验真（acg 助手同款思路）：CRC32 只有 32 位，同哈希解出的 2~6 个候选里多数是没人注册的号，
+     * 所以并行打名片，存在的排前面、0 级的降后（acg 直接丢弃 0 级，我们只降序以免误杀真发了弹幕的新号）。
+     * 一个都不存在时返回空：这恰恰说明号主是 10 位以上的新号，此时必须说「查不到」，不能把假号端出去。 */
+    async function rankUids(uids) {
+        const pro = await Promise.all(uids.map(async uid => {
+            const d = await getNow(`https://api.bilibili.com/x/web-interface/card?mid=${uid}`);
+            const card = d.json?.code === 0 ? d.json.data?.card : null;
+            return { uid, live: !!card, lv: Number(card?.level_info?.current_level || 0) };
+        }));
+        return pro.filter(p => p.live).sort((a, b) => (b.lv > 0) - (a.lv > 0) || a.uid - b.uid).map(p => p.uid);
+    }
+
+    async function dmSenderOf(sec, text) {
+        const cid = videoCid();
+        if (!cid) return { fail: '取不到当前分P 的 cid' };
+        const seg = Math.floor(sec * 1000 / CFG.dmSegMs) + 1;
+        const key = `${lineTag()}:seg:${cid}:${seg}`;
+        let rows = dmSegCache.get(key);
+        if (!rows) {
+            const r = await get(`https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid=${cid}&segment_index=${seg}`,
+                { referer: location.href.split('?')[0], binary: true, timeout: 15000 });
+            if (r.fail) return { fail: r.fail };
+            rows = decodeSeg(r.bin);
+            dmSegCache.set(key, rows);
+        }
+        if (!rows.length) return { fail: '这一段没有弹幕' };
+        let hit = rows.filter(x => x.sec === sec && x.text === text);
+        if (!hit.length) hit = rows.filter(x => Math.abs(x.sec - sec) <= 1 && x.text === text);
+        if (!hit.length) return { fail: '这条弹幕不在该分段里（特殊/字幕弹幕）' };
+        const maxLen = state.dmDeep ? 10 : 9;
+        const uids = [];
+        for (const x of hit) {
+            const direct = /^b(\d+)$/.exec(x.hash);
+            // 缓存键带位数：否则开过精查再关掉，会读到旧的 9 位候选表
+            const ck = maxLen + ':' + x.hash;
+            const got = direct ? [Number(direct[1])]
+                : (/^[0-9a-fA-F]{1,8}$/.test(x.hash) ? (dmUidCache.get(ck) || dmCrack(x.hash, maxLen)) : []);
+            if (got.length && !direct) dmUidCache.set(ck, got);
+            uids.push(...got);
+        }
+        const list = [...new Set(uids)];      // 同一人发过两条会给出同一批候选，去重后再排
+        if (!list.length) return { fail: '这条解不出 UID：多半号主是 10 位以上的新号，本地表覆盖不到' + (state.dmDeep ? '' : '；设置里打开「多认 10 位新号」可多覆盖一批') };
+        if (!state.dmVerify || list.length < 2) return { uids: list };
+        const alive = await rankUids(list);
+        return alive.length ? { uids: alive }
+            : { fail: `反解出的 ${list.length} 个候选名片上都查不到人，真号多半是 10 位以上的新号` };
+    }
+
+    /* 行节点被虚拟化回收，所以监听挂在容器上、全页只留一个按钮节点跟着鼠标搬。
+     * 状态不能存在按钮上（一搬走这次点击的结果就作废，手抖即丢），改存 WeakMap：按行记，行被回收自动释放。 */
+    let dmPanel = null, dmBtn = null, dmSpin = null, dmSpinning = false;
+    const dmState = new WeakMap();
+    const dmBadge = () => dmBtn.lastChild;                  // 建按钮时追加的 <i>：图标右上角的小角标
+    // 角标就是「按了有没有反应」的可见答案：… 在跑，! 失败，数字 = 当前是第几个候选（单候选没得切，不显示）
+    function dmPaint(row) {
+        if (!dmBtn || dmBtn.parentElement !== row) return;
+        const s = dmState.get(row), n = s?.uids?.length || 0;
+        dmBadge().textContent = s?.busy ? '…' : s?.fail ? '!' : n > 1 ? String(s.i + 1) : '';
+        dmBtn.title = s?.busy ? '正在解析，稍等' : s?.fail ||
+            (n ? (n > 1 ? `候选 ${s.i + 1}/${n}：UID ${s.uids[s.i]}，再点切换` : `UID ${s.uids[0]}`) : '查这条弹幕的发送者成分');
+        dmSetSpin(!!s?.busy);                               // 呼吸态跟着「当前显示的那一行」走，不跟着请求走
+    }
+    // 加载动效走 WAAPI：不往播放器里塞样式表，cancel() 后不留任何内联残留
+    function dmSetSpin(on) {
+        if (on === dmSpinning || !dmBtn) return;
+        dmSpinning = on;
+        dmSpin?.cancel(); dmSpin = null;
+        if (on) dmSpin = dmBtn.animate([{ opacity: .25 }, { opacity: 1 }], { iterations: Infinity, duration: 800 });
+    }
+    const dmOver = e => {
+        const row = e.target.closest && e.target.closest('.dm-info-row');
+        if (!row) return;
+        if (!dmBtn) {
+            dmBtn = document.createElement('span');
+            dmBtn.innerHTML = ICON + '<i style="position:absolute;right:-2px;top:-5px;font:9px/1 sans-serif;' +
+                'font-style:normal;color:#fb7299;text-shadow:0 0 2px #fff"></i>';   // 与评论区楼层同一个放大镜
+            dmBtn.title = '查这条弹幕的发送者成分';
+            // 行本身是 position:relative，且时间列尾部本就空着一截：绝对定位钉进这条缝，
+            // 不参与 flex 排版，正文一个像素都不会被顶动。尺寸写死在 svg 上，防被播放器样式表放大。
+            dmBtn.style.cssText = 'position:absolute;top:50%;transform:translateY(-50%);' +
+                'width:12px;height:12px;line-height:0;color:#fb7299;cursor:pointer;opacity:.85;z-index:2;' +
+                // 播放器的样式表把 .dm-info-row 里的 span 一律设成 pointer-events:none，
+                // 它自己的「屏蔽/举报」按钮再单独声明 auto。我们不挂类名，不声明就拿不到点击。
+                'pointer-events:auto';
+            dmBtn.firstChild.style.cssText = 'width:12px;height:12px;display:block';
+            dmBtn.addEventListener('click', dmClick, true);
+        }
+        if (dmBtn.parentElement === row) return;
+        row.appendChild(dmBtn);
+        const tr = row.querySelector('.dm-info-time'), rr = row.getBoundingClientRect();
+        dmBtn.style.left = Math.max(2, Math.round((tr ? tr.getBoundingClientRect().right : rr.left + 60) - rr.left - 16)) + 'px';
+        dmPaint(row);
+    };
+    async function dmClick(e) {
+        e.preventDefault(); e.stopPropagation();        // 行本身可点，别把跳转一起触发
+        const btn = e.currentTarget, row = btn.parentElement;
+        if (!row) return;
+        const old = dmState.get(row);
+        if (old?.busy) {                                // 进行中再点：给一次可见反馈，不重复发请求
+            cfqPulse(btn, 'translateY(-50%) ');         // 这颗按钮的定位靠 translateY，动画里必须带上，否则会跳位
+            return;
+        }
+        if (old?.uids?.length) {                        // 已解出过：再点就在候选间切换，不再发请求
+            old.i = (old.i + 1) % old.uids.length;
+            dmPaint(row);
+            const n = old.uids.length;
+            return runQuery(old.uids[old.i], n > 1 ? `弹幕候选 ${old.i + 1}/${n}` : '弹幕发送者');
+        }
+        const dm = row.querySelector('.dm-info-dm');
+        const text = ((dm && (dm.getAttribute('title') || dm.textContent)) || '').trim();
+        const t = (row.querySelector('.dm-info-time')?.textContent || '').trim().split(':').map(Number);
+        if (!text || t.length < 2) return;
+        const sec = t.length === 3 ? t[0] * 3600 + t[1] * 60 + t[2] : t[0] * 60 + t[1];
+        const st = { busy: true, uids: null, i: 0, fail: '' };
+        dmState.set(row, st);
+        dmPaint(row);
+        const r = await dmSenderOf(sec, text);
+        st.busy = false;
+        Object.assign(st, r.fail ? { fail: r.fail } : { uids: r.uids, i: 0 });
+        dmPaint(row);                                   // 按钮已经搬去别行时这里什么都不做，结果仍留在这一行的状态里
+        if (!r.fail) return runQuery(st.uids[0], st.uids.length > 1 ? `弹幕候选 1/${st.uids.length}` : '弹幕发送者');
+        // 失败要响：面板开着就把原因显示在顶部，不能只塞进 tooltip
+        if (state.query && !state.query.loading) { state.query.warn = r.fail; render(); }
+    }
+    function hookDmList() {
+        const box = document.querySelector('.bpx-player-dm-container');
+        if (!box || box === dmPanel) return;
+        unhookDmList();
+        box.addEventListener('mouseover', dmOver);
+        dmPanel = box;
+    }
+    function unhookDmList() {
+        if (!dmPanel) return;
+        dmPanel.removeEventListener('mouseover', dmOver);
+        dmSpin?.cancel(); dmSpin = null; dmSpinning = false;
+        dmBtn?.remove(); dmBtn = null; dmPanel = null;
     }
 
     let warmed = false;
 
     function scan() {
         scanLive();
+        try { state.dmList ? hookDmList() : unhookDmList(); }
+        catch (e) { state.dmList = false; console.warn('[成分查询] 弹幕列表挂载失败，本次已自动停用该功能：', e); }
         const sr = commentRoot();
         if (!sr) {
             if (observedRoot) { mainObserver?.disconnect(); observedRoot = null; }
